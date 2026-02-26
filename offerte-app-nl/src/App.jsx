@@ -46,6 +46,15 @@ export default function OfferteAppNL() {
 
   const [selfTests, setSelfTests] = useState([]);
   const previewRef = useRef(null);
+  const toastTimer = useRef(null);
+
+  function showToast(msg, duration = 6000) {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    if (msg) {
+      toastTimer.current = setTimeout(() => setToast(""), duration);
+    }
+  }
 
   useEffect(() => {
     try {
@@ -91,12 +100,20 @@ export default function OfferteAppNL() {
   }
   function addItem() { setItems(prev => [ ...prev, { ...DEFAULT_ITEM } ]); }
   function removeItem(idx) {
-    setItems(prev => prev.filter((_,i) => i!==idx));
+    setItems(prev => {
+      if (prev.length <= 1) return prev; // Altijd minstens 1 regel
+      return prev.filter((_,i) => i!==idx);
+    });
   }
 
-  function onFotosChange(e) {
+  async function onFotosChange(e) {
     const files = Array.from(e.target.files || []);
-    const mapped = files.map(f => ({ file: f, url: URL.createObjectURL(f) }));
+    const mapped = await Promise.all(
+      files.map(async f => {
+        const dataUrl = await fileToDataUrl(f);
+        return { name: f.name, type: f.type || "image/jpeg", dataUrl };
+      })
+    );
     setFotos(prev => [ ...prev, ...mapped ]);
   }
   function removeFoto(index) {
@@ -106,7 +123,7 @@ export default function OfferteAppNL() {
   async function generatePdf() {
     try {
       setLoadingPdf(true);
-      setToast("PDF genereren…");
+      showToast("PDF genereren…");
 
       const node = previewRef.current;
       if (!node) throw new Error("Preview niet gevonden");
@@ -117,33 +134,41 @@ export default function OfferteAppNL() {
       const pdf = new jsPDF("p", "mm", "a4");
       const pageWidth = 210;
       const pageHeight = 297;
-      const imgProps = { width: pageWidth, height: (canvas.height * pageWidth) / canvas.width };
-      pdf.addImage(imgData, "PNG", 0, 0, imgProps.width, imgProps.height);
+      const imgHeight = (canvas.height * pageWidth) / canvas.width;
+
+      // Handle multi-page content if preview is taller than one A4 page
+      let yOffset = 0;
+      while (yOffset < imgHeight) {
+        if (yOffset > 0) pdf.addPage();
+        pdf.addImage(imgData, "PNG", 0, -yOffset, pageWidth, imgHeight);
+        yOffset += pageHeight;
+      }
 
       if (fotos.length) {
         for (let i=0; i<fotos.length; i++) {
           pdf.addPage();
           const f = fotos[i];
-          const img = await fileToDataUrl(f.file);
           const margin = 10;
           const maxW = pageWidth - margin*2;
           const maxH = pageHeight - margin*2;
-          const dims = await imageDimensions(img);
+          const dims = await imageDimensions(f.dataUrl);
           const ratio = Math.min(maxW/dims.w, maxH/dims.h);
           const w = dims.w * ratio;
           const h = dims.h * ratio;
           const x = (pageWidth - w)/2;
           const y = (pageHeight - h)/2;
-          pdf.addImage(img, "JPEG", x, y, w, h);
+          pdf.addImage(f.dataUrl, "JPEG", x, y, w, h);
         }
       }
 
-      const blob = pdfOutputBlob(pdf);
+      const blob = pdf.output("blob");
       setPdfBlob(blob);
-      setToast("PDF klaar (niet verzonden). Je kunt nu mailen of downloaden.");
+      showToast("PDF klaar (niet verzonden). Je kunt nu mailen of downloaden.");
+      return blob;
     } catch (err) {
       console.error(err);
-      setToast(`Fout bij PDF genereren: ${err.message}`);
+      showToast(`Fout bij PDF genereren: ${err.message}`, 10000);
+      return null;
     } finally {
       setLoadingPdf(false);
     }
@@ -161,18 +186,17 @@ export default function OfferteAppNL() {
 
   async function sendEmail() {
     try {
-      if (!klant.email) return setToast("Vul een klant e‑mailadres in.");
-      if (emailCfg.provider !== "emailjs") return setToast("Alleen EmailJS is nu ondersteund.");
+      if (!klant.email) return showToast("Vul een klant e‑mailadres in.");
+      if (emailCfg.provider !== "emailjs") return showToast("Alleen EmailJS is nu ondersteund.");
       const { serviceId, templateId, publicKey } = emailCfg;
-      if (!serviceId || !templateId || !publicKey) return setToast("Vul EmailJS serviceId, Template ID en Public Key in bij Instellingen.");
+      if (!serviceId || !templateId || !publicKey) return showToast("Vul EmailJS serviceId, Template ID en Public Key in bij Instellingen.");
 
-      setToast("E‑mail voorbereiden…");
+      showToast("E‑mail voorbereiden…");
       emailjs.init({ publicKey });
 
-      if (!pdfBlob) await generatePdf();
-
-      const pdfFile = new File([pdfBlob], `${offerte.nummer}.pdf`, { type: "application/pdf" });
-      const fotoFiles = fotos.map((f,idx) => new File([f.file], `foto-${idx+1}-${sanitizeFilename(f.file.name)}`, { type: f.file.type || "image/jpeg" }));
+      // Use return value to avoid React state race condition
+      const blob = pdfBlob || await generatePdf();
+      if (!blob) return showToast("PDF genereren mislukt, e‑mail niet verzonden.");
 
       const onderwerp = template(emailCfg.onderwerp, {
         offerteNummer: offerte.nummer,
@@ -187,7 +211,7 @@ export default function OfferteAppNL() {
 
       const htmlInhoud = buildOfferteHtml({ bedrijf, klant, offerte, items, totals });
 
-      setToast("E‑mail verzenden via EmailJS…");
+      showToast("E‑mail verzenden via EmailJS…");
       await emailjs.send(
         serviceId,
         templateId,
@@ -199,16 +223,13 @@ export default function OfferteAppNL() {
           from_name: emailCfg.afzenderNaam || bedrijf.naam,
           from_email: emailCfg.afzenderEmail || bedrijf.email,
           html_content: htmlInhoud
-        },
-        {
-          attachments: [pdfFile, ...fotoFiles]
         }
       );
 
-      setToast("E‑mail verzonden! (controleer je inbox/uitgaande mail in EmailJS)");
+      showToast("E‑mail verzonden! (controleer je inbox/uitgaande mail in EmailJS). Let op: bijlagen (PDF/foto's) worden niet meegestuurd via EmailJS browser SDK – gebruik download en handmatig bijvoegen.", 12000);
     } catch (err) {
       console.error(err);
-      setToast(`Fout bij e‑mail verzenden: ${err.message}`);
+      showToast(`Fout bij e‑mail verzenden: ${err.message}`, 10000);
     }
   }
 
@@ -292,7 +313,7 @@ export default function OfferteAppNL() {
               <div className="mt-3 grid grid-cols-3 sm:grid-cols-4 gap-3">
                 {fotos.map((f,idx)=> (
                   <div key={idx} className="relative group">
-                    <img src={f.url} alt="foto" className="w-full h-28 object-cover rounded-lg border" />
+                    <img src={f.dataUrl} alt="foto" className="w-full h-28 object-cover rounded-lg border" />
                     <button onClick={()=>removeFoto(idx)} className="absolute top-1 right-1 hidden group-hover:block bg-white/90 rounded-full w-7 h-7 border">×</button>
                   </div>
                 ))}
@@ -374,7 +395,7 @@ export default function OfferteAppNL() {
                   <div className="font-semibold mb-2">Foto‑overzicht</div>
                   <div className="grid grid-cols-3 gap-3">
                     {fotos.slice(0,6).map((f,idx)=> (
-                      <img key={idx} src={f.url} alt="bijlage" className="w-full h-24 object-cover rounded-lg border" />
+                      <img key={idx} src={f.dataUrl} alt="bijlage" className="w-full h-24 object-cover rounded-lg border" />
                     ))}
                   </div>
                   {fotos.length>6 && (
@@ -384,7 +405,7 @@ export default function OfferteAppNL() {
               )}
 
               <div className="mt-8 text-xs text-gray-500">
-                Deze offerte is opgesteld door {bedrijf.naam}. Prijzen zijn inclusief BTW tenzij anders vermeld.
+                Deze offerte is opgesteld door {bedrijf.naam}. Prijzen zijn exclusief BTW tenzij anders vermeld.
               </div>
             </div>
           </Card>
@@ -409,11 +430,11 @@ function Card({ title, children }) {
   );
 }
 
-function Input({ label, type="text", value, onChange, className="" }) {
+function Input({ label, type="text", value, onChange, className="", ...rest }) {
   return (
     <label className={`block ${className}`}>
       <span className="text-xs text-gray-600">{label}</span>
-      <input type={type} value={value||""} onChange={e=>onChange(e.target.value)} className="mt-1 w-full h-10 rounded-lg border px-3 focus:outline-none focus:ring-2 focus:ring-indigo-200" />
+      <input type={type} value={value||""} onChange={e=>onChange(e.target.value)} className="mt-1 w-full h-10 rounded-lg border px-3 focus:outline-none focus:ring-2 focus:ring-indigo-200" {...rest} />
     </label>
   );
 }
@@ -445,7 +466,7 @@ function Settings({ emailCfg, setEmailCfg }) {
                   <li>Maak een gratis account aan op emailjs.com en voeg je e‑mailprovider toe.</li>
                   <li>Maak een <em>Service</em>, een <em>Template</em> met velden: <code>subject, message, to_email, to_name, from_name, from_email, html_content</code>.</li>
                   <li>Plaats je <em>Service ID</em>, <em>Template ID</em> en <em>Public Key</em> hieronder.</li>
-                  <li>Bijlagen: de PDF en eventuele foto's worden automatisch meegestuurd.</li>
+                  <li>Let op: EmailJS browser SDK ondersteunt geen bijlagen. Download de PDF apart en voeg deze handmatig toe.</li>
                 </ul>
               </div>
 
@@ -522,15 +543,6 @@ async function imageDimensions(src) {
     img.src = src;
   });
 }
-function pdfOutputBlob(pdf) {
-  const dataUriString = pdf.output("datauristring");
-  const base64 = dataUriString.split(",")[1];
-  const byteChars = atob(base64);
-  const byteNumbers = new Array(byteChars.length);
-  for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
-  const byteArray = new Uint8Array(byteNumbers);
-  return new Blob([byteArray], { type: "application/pdf" });
-}
 
 function buildOfferteHtml({ bedrijf, klant, offerte, items, totals }) {
   const rows = items.map(it => {
@@ -564,7 +576,6 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
-function SelfTestPanelInline() { return null } // placeholder if needed
 function runSelfTests() {
   const cases = [];
   // escapeHtml
